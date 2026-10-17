@@ -22,6 +22,8 @@ On Mac, the command always has the 3 (`python3`). Typing `python` or `pip` witho
 
 The app opens in your browser at `http://localhost:8501`. This is a page on your own computer, not on the internet.
 
+**Password:** the app asks for a password. Before the first run, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set your own password in it. `secrets.toml` is not uploaded to GitHub.
+
 ## 3. First use: check the scale
 
 Open an `.nd2` file in Fiji and go to **Image → Properties** to see *Pixel width*. Then drop the same file into the app and compare with the line "Scale: … µm/pixel". The two numbers must match. If they don't, or the metadata says exactly 1.0, turn on "Enter scale manually" in the sidebar.

@@ -4,6 +4,7 @@ app.py — local user interface.   Run:  streamlit run app.py
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -354,7 +355,28 @@ def tab_batch(p: oc.Params, px_override):
 
 # ----------------------------------------------------------------------------
 
+def require_password():
+    """Stop the page until the user enters the password from .streamlit/secrets.toml."""
+    if st.session_state.get("authenticated"):
+        return
+    try:
+        expected = st.secrets["password"]
+    except (KeyError, FileNotFoundError):
+        st.error("No password is set. Copy .streamlit/secrets.toml.example to .streamlit/secrets.toml "
+                 "and set a password.")
+        st.stop()
+    st.title("Organoid morphology analysis")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if hmac.compare_digest(pw.encode("utf-8"), str(expected).encode("utf-8")):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        st.error("Wrong password.")
+    st.stop()
+
+
 def main():
+    require_password()
     st.title("Organoid morphology analysis")
     st.caption("Single tube or branched · runs entirely on this computer, images are not sent anywhere")
     p, px_override = sidebar_params()
