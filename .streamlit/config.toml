@@ -1,0 +1,8 @@
+[server]
+# Open on this computer only; other computers on the network cannot access it
+address = "localhost"
+# Allow drag-and-drop of large .nd2 files (MB)
+maxUploadSize = 4096
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit secrets (config.toml is kept)
+.streamlit/secrets.toml
+
+# Microscopy images and analysis outputs (can be large / unpublished data)
+data/
+results/
+*.nd2
+*.tif
+*.tiff
+*_mask.png
+errors.csv
+group_comparison.csv
+group_comparison.png
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
