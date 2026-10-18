@@ -27,16 +27,20 @@ from skimage import filters, measure, transform
 @dataclass
 class Params:
     # Organoid segmentation
-    seg_method: str = "combo"       # "combo" (texture or dark) | "texture" | "dark" | "bright"
+    seg_method: str = "combo"       # "combo" (texture or dark) | "tube" (ridge filter) | "texture" | "dark" | "bright"
+    tube_width_um: float = 0.0      # "tube" method: typical tube width (µm), 0 = try a range of widths automatically
     texture_um: float = 5.0         # radius of the region used to measure "roughness" (µm)
     threshold_scale: float = 1.0    # >1: tighter mask, <1: looser mask
     smooth_um: float = 5.0          # mask edge smoothing (µm)
     edge_shrink: float = 2.0        # shrink edge inward (× filter radius) to compensate for the filter "bleeding" into the background
     low_ratio: float = 0.6          # fainter parts connected to clear parts are kept if > low_ratio × threshold (1 = off)
     join_gap_um: float = 30.0       # join large pieces no farther than this from the main piece (µm), 0 = off
+    hole_factor: float = 1.0        # holes narrower than (factor × tube width) are filled; wider holes are real lumens/loops
     # Skeleton
     spur_factor: float = 1.0        # dead-end branches shorter than (factor × tube width) are treated as spurs
     min_branch_um: float = 0.0      # absolute minimum branch length (µm), 0 = ignore
+    # Classification
+    single_tube_min_fraction: float = 0.8   # "single tube" = no loops and main path ≥ this fraction of the skeleton
     # Image reading
     max_dim: int = 2048             # larger images are downscaled for analysis (0 = no downscaling)
     z_mode: str = "edf"             # "edf" (merge slices, take sharpest regions) | "best" (single sharpest slice) | "index"
@@ -64,15 +68,20 @@ class LoadedImage:
 
 # Key metrics used to compare groups
 KEY_METRICS = [
+    "is_single_tube",
     "main_path_fraction",
     "n_junctions",
-    "tortuosity",
-    "rms_dev_rel",
+    "junctions_per_mm",
+    "n_cycles",
     "solidity",
-    "width_cv",
 ]
 
+# Yes/no metrics: compared as proportions (Fisher / chi-square) instead of medians
+BINARY_METRICS = {"is_single_tube"}
+
 METRIC_LABELS = {
+    "is_single_tube": "Single tube (1 = yes, 0 = branched)",
+    "junctions_per_mm": "Junctions per mm of skeleton",
     "main_path_fraction": "Main path / total skeleton",
     "n_junctions": "Junctions",
     "n_endpoints": "Endpoints",
@@ -381,18 +390,43 @@ def _components(m):
     return lab, n, np.asarray(sizes, dtype=float)
 
 
+def tube_width(m):
+    """Typical tube width (px) = 2 × median distance to the edge along the skeleton."""
+    from skimage.morphology import skeletonize
+    sk = skeletonize(m)
+    if not sk.any():
+        return 2.0
+    return float(2 * np.median(ndi.distance_transform_edt(m)[sk]))
+
+
+def fill_small_holes(m, factor=1.0, width=None):
+    """Fill holes whose own width (largest inscribed circle) is below factor × tube width.
+    Wider holes are real lumens between branches of a network and stay open (loops in the skeleton)."""
+    m = m.astype(bool)
+    holes = ndi.binary_fill_holes(m) & ~m
+    if not holes.any():
+        return m
+    lab, n, _ = _components(holes)
+    width = tube_width(m) if width is None else width
+    hole_w = 2 * np.asarray(ndi.maximum(ndi.distance_transform_edt(holes), lab, np.arange(1, n + 1)))
+    small = np.nonzero(hole_w < factor * width)[0] + 1
+    return m | np.isin(lab, small)
+
+
 def clean_mask(mask, r_px, keep_all=False):
-    """Smooth the mask, fill holes. keep_all=False: keep only the largest region."""
+    """Smooth the mask, fill holes smaller than the smoothing scale (larger holes are judged later,
+    once the edge is in its final place). keep_all=False: keep only the largest region."""
     m = mask.astype(bool)
+    w = 2 * max(r_px, 1.0)
     if r_px >= 1:
         m = _erode(_dilate(m, r_px), r_px)       # closing
-        m = ndi.binary_fill_holes(m)
+        m = fill_small_holes(m, 1.0, w)
         m = _dilate(_erode(m, r_px), r_px)       # opening
     if not keep_all:
         m = _largest_component(m)
     if r_px >= 1:
         m = ndi.gaussian_filter(m.astype(np.float32), r_px / 2) > 0.5
-    m = ndi.binary_fill_holes(m)
+    m = fill_small_holes(m, 1.0, w)
     return m if keep_all else _largest_component(m)
 
 
@@ -473,6 +507,9 @@ def _polarity(g, tex, valid):
     return 1 if np.median(g[obj]) < np.median(g[bg]) else -1
 
 
+TUBE_HIGH, TUBE_LOW = 2.5, 1.45     # "tube" method: threshold multipliers (high, faint parts)
+
+
 def segment(gray, px_um, p: Params):
     """Returns (mask, feature, info). The mask keeps only the main organoid (plus joined pieces)."""
     px = px_um or 1.0
@@ -512,12 +549,31 @@ def segment(gray, px_um, p: Params):
         tex = norm(texture())
         sign = _polarity(g, tex, valid)
         feat = np.maximum(tex, norm(contrast(s_tex, sign)))
+    elif p.seg_method == "tube":
+        # ridge (tubeness) filter: strong on elongated tubes, weak on round blobs and grainy cell clumps
+        sign = _polarity(g, norm(texture()), valid)
+        if p.tube_width_um > 0:
+            r = p.tube_width_um / px / 2
+        else:
+            # estimate the tube width with a quick first pass over a wide range of scales
+            first = norm(filters.sato(g, sigmas=np.geomspace(2.0, max(3.0, min(g.shape) / 60), 5),
+                                      black_ridges=sign > 0))
+            m0 = _largest_component(first > filters.threshold_otsu(first[valid]))
+            r = tube_width(m0) / 2
+        sigmas = np.geomspace(max(1.0, r / 3), max(1.5, r), 4)
+        sigma_used = float(sigmas[0])
+        feat = norm(filters.sato(g, sigmas=sigmas, black_ridges=sign > 0))
     else:
         raise ValueError(f"Invalid segmentation method: {p.seg_method}")
     t = filters.threshold_otsu(feat[valid]) * p.threshold_scale
+    low = max(p.low_ratio, 0.05) * t
+    if p.seg_method == "tube":
+        # ridge response is skewed: only strong ridges start the mask, weaker ridges connected to them are
+        # kept (calibrated so the default settings trace thin connecting tubes but not ridges in cell clumps)
+        t, low = TUBE_HIGH * t, TUBE_LOW * low
     if p.low_ratio < 1:
         # fainter regions connected to clear regions are still kept (hysteresis)
-        raw = filters.apply_hysteresis_threshold(feat, max(p.low_ratio, 0.05) * t, t)
+        raw = filters.apply_hysteresis_threshold(feat, low, t)
     else:
         raw = feat > t
     allm = clean_mask(raw, p.smooth_um / px, keep_all=True)
@@ -533,9 +589,9 @@ def segment(gray, px_um, p: Params):
         keep, joined = _join_pieces(lab, sizes, main_i, p.join_gap_um / px)
         kept_labels += joined
         info["joined"] = len(joined)
-    keep = ndi.binary_fill_holes(keep)
     if p.edge_shrink > 0:
         keep = _shrink_keep_connected(keep, p.edge_shrink * sigma_used)
+    keep = fill_small_holes(keep, p.hole_factor)   # after shrinking, when holes have their real size
 
     # Dropped pieces (only significant ones, ≥ 5% of the main piece, to avoid reporting debris)
     sig = [i + 1 for i in range(n) if sizes[i] >= 0.05 * sizes[main_i]]
@@ -548,7 +604,7 @@ def segment(gray, px_um, p: Params):
     return keep, feat, info
 
 
-def load_mask(path, shape):
+def load_mask(path, shape, hole_factor=1.0):
     """Read an existing mask (from Fiji / ilastik / Cellpose...) and resize it to match."""
     import imageio.v3 as iio
     m = np.asarray(iio.imread(path))
@@ -557,7 +613,7 @@ def load_mask(path, shape):
     m = m > 0
     if m.shape != tuple(shape):
         m = transform.resize(m.astype(np.float32), shape, order=0, preserve_range=True) > 0.5
-    m = ndi.binary_fill_holes(m)
+    m = fill_small_holes(m, hole_factor)
     return _largest_component(m)
 
 
@@ -722,6 +778,11 @@ def analyze(gray, px_um, p: Params | None = None, mask=None):
     m["skeleton_length_um"] = total_len_px * px
     m["main_length_um"] = main_len_px * px
     m["main_path_fraction"] = (main_len_px / total_len_px) if total_len_px > 0 else float("nan")
+    m["junctions_per_mm"] = len(junc_clusters) / (total_len_px * px / 1000) if total_len_px > 0 else float("nan")
+    # Single tube = no closed loops and the main path covers most of the skeleton
+    single = (n_cycles == 0 and len(main_path) > 0
+              and m["main_path_fraction"] >= p.single_tube_min_fraction)
+    m["is_single_tube"] = int(single)
 
     main_pts = coords[main_path].astype(np.float64) if main_path else np.zeros((0, 2))
     if len(main_pts) >= 3:
@@ -783,6 +844,7 @@ def analyze(gray, px_um, p: Params | None = None, mask=None):
         "endpoints_yx": coords[ends] if ends else np.zeros((0, 2), int),
         "spur_threshold_um": thresh_px * px,
         "units_are_um": unit_ok,
+        "shape_class": "single tube" if single else "branched / network",
         "warnings": warnings,
         "dropped": dropped,
     }
@@ -791,7 +853,7 @@ def analyze(gray, px_um, p: Params | None = None, mask=None):
 def analyze_file(path, p: Params | None = None, px_um_override=None, mask_path=None):
     p = p or Params()
     img = load_image(path, p, px_um_override)
-    mask = load_mask(mask_path, img.gray.shape) if mask_path else None
+    mask = load_mask(mask_path, img.gray.shape, p.hole_factor) if mask_path else None
     res = analyze(img.gray, img.px_um, p, mask=mask)
     return img, res
 
@@ -815,7 +877,9 @@ def _nice_bar(width_um):
 
 
 def render_overlay(gray, res, px_um, title=None, dpi=110):
-    """Draw image + mask outline + main path + side branches. Returns PNG bytes."""
+    """Draw image + mask outline + skeleton. Single tube: main path (cyan) + side branches (orange).
+    Branched / network: the whole skeleton in orange, since one "main path" would be misleading.
+    Returns PNG bytes."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -832,6 +896,7 @@ def render_overlay(gray, res, px_um, title=None, dpi=110):
         ax.contour(dropped.astype(float), levels=[0.5], colors=[DROPPED_COLOR], linewidths=1.2,
                    linestyles="dashed")
     lw = max(1.6, 2.2 * 7.0 * dpi / max(w, 1) / 1.5)
+    single = res.get("shape_class", "single tube") == "single tube"
     side = res["side_yx"]
     if len(side):
         ov = np.zeros((h, w), bool)
@@ -843,7 +908,8 @@ def render_overlay(gray, res, px_um, title=None, dpi=110):
         ax.imshow(rgba, interpolation="nearest")
     mp = res["main_path_yx"]
     if len(mp):
-        ax.plot(mp[:, 1], mp[:, 0], color=MAIN_COLOR, lw=lw, solid_capstyle="round")
+        ax.plot(mp[:, 1], mp[:, 0], color=MAIN_COLOR if single else SIDE_COLOR, lw=lw if single else lw * 0.6,
+                solid_capstyle="round")
     j = res["junctions_yx"]
     if len(j):
         ax.scatter(j[:, 1], j[:, 0], s=36, c=SIDE_COLOR, edgecolors="white", linewidths=0.8, zorder=5)
@@ -859,16 +925,21 @@ def render_overlay(gray, res, px_um, title=None, dpi=110):
         ax.text(x0 + bar_px / 2, y0 - h * 0.015, f"{bar_um:g} µm", color="white",
                 ha="center", va="bottom", fontsize=9)
 
-    handles = [Line2D([], [], color=MAIN_COLOR, lw=2.5, label="Main path"),
-               Line2D([], [], color=SIDE_COLOR, lw=2.5, label="Side branch"),
-               Line2D([], [], marker="o", ls="", markerfacecolor=SIDE_COLOR, markeredgecolor="white",
+    if single:
+        handles = [Line2D([], [], color=MAIN_COLOR, lw=2.5, label="Main path"),
+                   Line2D([], [], color=SIDE_COLOR, lw=2.5, label="Side branch")]
+    else:
+        handles = [Line2D([], [], color=SIDE_COLOR, lw=2.5, label="Skeleton (branched)")]
+    handles += [Line2D([], [], marker="o", ls="", markerfacecolor=SIDE_COLOR, markeredgecolor="white",
                       markersize=7, label="Junction"),
                Line2D([], [], color=OUTLINE_COLOR, lw=1, label="Organoid outline")]
     if has_dropped:
         handles.append(Line2D([], [], color=DROPPED_COLOR, lw=1.2, ls="--", label="Dropped part"))
     ax.legend(handles=handles, loc="upper left", fontsize=8, framealpha=0.75)
-    if title:
-        ax.set_title(title, fontsize=10)
+    m = res.get("metrics", {})
+    verdict = (f"{res['shape_class'].upper()} · main path {m.get('main_path_fraction', float('nan')):.2f} of skeleton · "
+               f"{m.get('n_junctions', 0)} junctions · {m.get('n_cycles', 0)} loops") if "shape_class" in res else ""
+    ax.set_title("\n".join(t for t in (title, verdict) if t), fontsize=10)
     ax.set_axis_off()
     fig.tight_layout(pad=0.2)
     buf = io.BytesIO()

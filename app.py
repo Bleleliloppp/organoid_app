@@ -20,6 +20,7 @@ st.set_page_config(page_title="Organoid analysis", layout="wide")
 
 METHOD_LABELS = {
     "combo": "Texture or differs from background, auto bright/dark (default)",
+    "tube": "Tube network (ridge filter): ignores grainy cell clumps",
     "texture": "Texture only",
     "dark": "Darkness only (organoid darker than background)",
     "bright": "Organoid brighter than background",
@@ -32,11 +33,14 @@ Z_LABELS = {
 }
 
 METRIC_HELP = {
+    "is_single_tube": "1 = single tube (no loops, main path covers most of the skeleton), 0 = branched / network. "
+                      "Compared between groups as a percentage (Fisher's exact test).",
+    "junctions_per_mm": "Branch points per mm of skeleton. Size-independent measure of how branched it is. Single tube ≈ 0.",
     "main_path_fraction": "Single tube ≈ 1. The more branches, the lower. Key metric for 'does it form a single tube'.",
     "n_junctions": "Single tube = 0.",
     "n_endpoints": "Single tube = 2.",
     "n_branches": "Number of segments between endpoints and junctions. Single tube = 1.",
-    "n_cycles": "Usually = 0. Non-zero means the skeleton has closed loops (branches touching each other).",
+    "n_cycles": "Closed loops (lumens enclosed by branches, typical of a messy network). Single tube = 0.",
     "tortuosity": "Main path length / straight distance between its two ends. Straight = 1.",
     "rms_dev_rel": "RMS deviation from the best-fit straight line, divided by length. Straight = 0.",
     "max_dev_rel": "Maximum deviation from the best-fit straight line, divided by length.",
@@ -127,6 +131,10 @@ def sidebar_params():
     seg_method = sb.selectbox("Segmentation method", methods,
                               index=methods.index(defaults.seg_method) if defaults.seg_method in methods else 0,
                               format_func=METHOD_LABELS.get)
+    tube_width_um = sb.number_input("Typical tube width (µm), 'Tube network' method only", 0.0, 2000.0,
+                                    float(defaults.tube_width_um), 5.0,
+                                    help="0 = estimate automatically from the image. Set it if thin tubes are missed "
+                                         "(enter a smaller width) or the outline is too fat (enter a larger width).")
     texture_um = sb.slider("Filter radius (µm)", 1.0, 30.0, float(defaults.texture_um), 0.5,
                            help="Size of the region used to detect cell texture. Increase if the mask is patchy, decrease if it bleeds into the background.")
     threshold_scale = sb.slider("Threshold factor", 0.3, 3.0, float(defaults.threshold_scale), 0.05,
@@ -142,11 +150,19 @@ def sidebar_params():
     join_gap_um = sb.slider("Join pieces up to this distance apart (µm)", 0.0, 300.0, float(defaults.join_gap_um), 5.0,
                             help="If the mask is broken (dropped parts have a dashed red outline), large pieces closer than "
                                  "this distance are joined to the main organoid. 0 = off.")
+    hole_factor = sb.slider("Keep holes wider than (× tube width)", 0.25, 5.0, float(defaults.hole_factor), 0.25,
+                            help="Holes enclosed by branches (the empty spaces in a network) are kept and counted as loops. "
+                                 "Smaller holes are treated as segmentation gaps and filled. Increase if fake loops appear "
+                                 "inside a solid tube.")
 
     sb.subheader("Skeleton")
     spur_factor = sb.slider("Branch threshold (× tube width)", 0.0, 3.0, float(defaults.spur_factor), 0.1,
                             help="Dead-end branches shorter than (this value × mean tube width) are treated as spurs and removed. "
                                  "Keep fixed for all images when comparing.")
+    single_frac = sb.slider("Single tube: main path at least (fraction of skeleton)", 0.5, 1.0,
+                            float(defaults.single_tube_min_fraction), 0.05,
+                            help="An organoid counts as a single tube when it has no loops and its main path makes up at "
+                                 "least this fraction of the whole skeleton. Keep fixed for all images.")
     min_branch_um = sb.number_input("Minimum branch length (µm)", 0.0, 5000.0, float(defaults.min_branch_um), 5.0,
                                     help="Absolute threshold, optional extra. 0 = ignore.")
 
@@ -175,9 +191,10 @@ def sidebar_params():
             px_override = st.number_input("µm / pixel", 0.001, 100.0, float(px_default or 1.0),
                                           0.01, format="%.4f")
 
-    p = oc.Params(seg_method=seg_method, texture_um=texture_um, threshold_scale=threshold_scale,
+    p = oc.Params(seg_method=seg_method, tube_width_um=tube_width_um, texture_um=texture_um, threshold_scale=threshold_scale,
                   smooth_um=smooth_um, edge_shrink=edge_shrink, low_ratio=low_ratio,
-                  join_gap_um=join_gap_um, spur_factor=spur_factor,
+                  join_gap_um=join_gap_um, hole_factor=hole_factor, spur_factor=spur_factor,
+                  single_tube_min_fraction=single_frac,
                   min_branch_um=min_branch_um, max_dim=int(max_dim), z_mode=z_mode,
                   z_index=int(z_index), channel=int(channel), position=int(position), time=int(time))
     sb.download_button("Save parameters (.json)",
@@ -247,7 +264,7 @@ def tab_single(p: oc.Params, px_override):
         st.caption("• " + n)
 
     try:
-        mask = oc.load_mask(save_upload(mask_up), img.gray.shape) if mask_up is not None else None
+        mask = oc.load_mask(save_upload(mask_up), img.gray.shape, p.hole_factor) if mask_up is not None else None
         with st.spinner("Analyzing..."):
             res = oc.analyze(img.gray, img.px_um, p, mask=mask)
             overlay = oc.render_overlay(img.gray, res, img.px_um, title=name)
@@ -259,18 +276,22 @@ def tab_single(p: oc.Params, px_override):
         st.warning(w)
 
     m = res["metrics"]
+    single = bool(m["is_single_tube"])
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Main path / total", fmt(m["main_path_fraction"]))
-    k2.metric("Junctions", fmt(m["n_junctions"]))
-    k3.metric("Tortuosity", fmt(m["tortuosity"]))
-    k4.metric("RMS deviation / length", fmt(m["rms_dev_rel"]))
+    k1.metric("Shape", "Single tube" if single else "Branched")
+    k2.metric("Main path / total", fmt(m["main_path_fraction"]))
+    k3.metric("Junctions", fmt(m["n_junctions"]))
+    if single:
+        k4.metric("Tortuosity", fmt(m["tortuosity"]))
+    else:
+        k4.metric("Closed loops", fmt(m["n_cycles"]))
 
-    if m["n_junctions"] == 0 and m["n_endpoints"] == 2:
+    if single:
         st.success("Single-tube organoid. Tortuosity and RMS deviation tell you whether the tube is curved or straight.")
-    elif m["n_junctions"] > 0:
-        st.info("Branched organoid. Here the 'main path' is the longest path through the organoid, so it may turn "
-                "into a branch; compare using main path / total, number of junctions and longest side branch, "
-                "and do not compare tortuosity with single tubes.")
+    else:
+        st.info("Branched / network organoid: there is no single main path, so the whole skeleton is drawn in orange. "
+                "Describe it with main path / total, junctions per mm and closed loops; tortuosity and RMS deviation "
+                "are not meaningful here.")
 
     a, b = st.columns(2)
     a.image(img.gray, caption="Original image (brightness normalized)", clamp=True)
@@ -280,7 +301,8 @@ def tab_single(p: oc.Params, px_override):
     st.dataframe(metrics_table(m, res["units_are_um"]))
 
     stem = os.path.splitext(name)[0]
-    row = pd.DataFrame([{"file": name, **m, "spur_threshold_um": res["spur_threshold_um"],
+    row = pd.DataFrame([{"file": name, "shape_class": res["shape_class"], **m,
+                         "spur_threshold_um": res["spur_threshold_um"],
                          "mask_source": "file" if mask is not None else "auto",
                          "notes": " | ".join(img.notes + res["warnings"])}])
     d1, d2, d3 = st.columns(3)

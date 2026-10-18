@@ -89,6 +89,7 @@ def run_batch(root, p: oc.Params, out_dir=None, px_um_override=None, progress=No
             row = {"file": rel, "group": group_of(f, root)}
             row.update(res["metrics"])
             row["spur_threshold_um"] = res["spur_threshold_um"]
+            row["shape_class"] = res["shape_class"]
             row["mask_source"] = "file" if mask_path else "auto"
             row["notes"] = " | ".join(img.notes + res["warnings"])
             rows.append(row)
@@ -118,7 +119,8 @@ def run_batch(root, p: oc.Params, out_dir=None, px_um_override=None, progress=No
 
 
 def group_summary(df, metrics=oc.KEY_METRICS):
-    """Median, interquartile range per group + p-value (Mann–Whitney for 2 groups, Kruskal–Wallis for >2)."""
+    """Median, interquartile range per group + p-value (Mann–Whitney for 2 groups, Kruskal–Wallis for >2).
+    Yes/no metrics (oc.BINARY_METRICS): proportion per group + Fisher's exact test (2 groups) or chi-square (>2)."""
     from scipy import stats
     groups = list(dict.fromkeys(df["group"]))
     rows, pvals = [], {}
@@ -128,8 +130,17 @@ def group_summary(df, metrics=oc.KEY_METRICS):
         samples = [df.loc[df["group"] == g, mtr].dropna().to_numpy(float) for g in groups]
         p = float("nan")
         valid = [s for s in samples if len(s) >= 2]
+        binary = mtr in oc.BINARY_METRICS
         try:
-            if len(valid) == 2 and len(valid) == len(samples):
+            if binary and len(valid) == len(samples) >= 2:
+                table = [[int((s == 1).sum()), int((s == 0).sum())] for s in samples]
+                if len(table) == 2:
+                    p = float(stats.fisher_exact(table).pvalue)
+                elif sum(r[0] for r in table) and sum(r[1] for r in table):
+                    p = float(stats.chi2_contingency(table).pvalue)
+                else:
+                    p = 1.0
+            elif len(valid) == 2 and len(valid) == len(samples):
                 p = float(stats.mannwhitneyu(valid[0], valid[1], alternative="two-sided").pvalue)
             elif len(valid) >= 3 and len(valid) == len(samples):
                 p = float(stats.kruskal(*valid).pvalue)
@@ -142,9 +153,10 @@ def group_summary(df, metrics=oc.KEY_METRICS):
                 "metric_label": oc.METRIC_LABELS.get(mtr, mtr),
                 "group": g,
                 "n": len(s),
-                "median": float(np.median(s)) if len(s) else float("nan"),
-                "q1": float(np.percentile(s, 25)) if len(s) else float("nan"),
-                "q3": float(np.percentile(s, 75)) if len(s) else float("nan"),
+                # for yes/no metrics "median" holds the proportion of "yes" (e.g. fraction of single tubes)
+                "median": (float(np.mean(s)) if binary else float(np.median(s))) if len(s) else float("nan"),
+                "q1": float(np.percentile(s, 25)) if len(s) and not binary else float("nan"),
+                "q3": float(np.percentile(s, 75)) if len(s) and not binary else float("nan"),
                 "p_value": p,
             })
     return pd.DataFrame(rows), pvals
@@ -179,6 +191,14 @@ def plot_groups(df, metrics=oc.KEY_METRICS, dpi=110):
             v = df.loc[df["group"] == g, mtr].dropna().to_numpy(float)
             if not len(v):
                 continue
+            if mtr in oc.BINARY_METRICS:  # bar = % of organoids that are "yes"
+                frac = float(np.mean(v))
+                ax.bar(gi, frac * 100, width=0.55, color=GROUP_COLORS[gi % len(GROUP_COLORS)], zorder=3)
+                ax.text(gi, frac * 100 + 2, f"{int(v.sum())}/{len(v)}", ha="center", va="bottom",
+                        fontsize=8.5, color=ink)
+                ax.set_ylim(0, 110)
+                ax.set_ylabel("% of organoids", fontsize=8.5, color=muted)
+                continue
             x = gi + rng.uniform(-0.13, 0.13, len(v))
             ax.scatter(x, v, s=34, color=GROUP_COLORS[gi % len(GROUP_COLORS)],
                        edgecolors="white", linewidths=0.8, zorder=3)
@@ -199,7 +219,8 @@ def plot_groups(df, metrics=oc.KEY_METRICS, dpi=110):
             ax.spines[s].set_color("#bdbcb5")
         ax.tick_params(colors=muted, labelsize=8.5)
     fig.text(0.01, 0.005, "Each dot is 1 organoid · black bar is the median · "
-             "p-value: Mann–Whitney (2 groups) or Kruskal–Wallis (>2 groups)",
+             "p-value: Mann–Whitney (2 groups) or Kruskal–Wallis (>2 groups); "
+             "single tube %: Fisher's exact (2 groups) or chi-square (>2)",
              fontsize=8.5, color=muted)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     buf = io.BytesIO()

@@ -55,6 +55,9 @@ Results are saved to `data/results/`:
 
 | CSV column | Meaning | Ideal single tube |
 |---|---|---|
+| `shape_class`, `is_single_tube` | Verdict per organoid: "single tube" (1) = no closed loops **and** main path ≥ 80% of the skeleton (adjustable); otherwise "branched / network" (0) | single tube / 1 |
+| `n_cycles` | Closed loops: empty spaces enclosed by branches, typical of a messy network | 0 |
+| `junctions_per_mm` | Branch points per mm of skeleton (does not depend on organoid size) | 0 |
 | `main_path_fraction` | Main path length / total skeleton length. **Key metric for "does it form a single tube"** | 1 |
 | `n_junctions` | Number of junctions (branch points) | 0 |
 | `n_endpoints` | Number of endpoints | 2 |
@@ -73,6 +76,15 @@ Results are saved to `data/results/`:
 - **Branching and curvature are two different things.** A curved tube is still one tube (`main_path_fraction` = 1, `n_junctions` = 0) but has high tortuosity. So to compare "branched vs single tube", use `main_path_fraction`, `n_junctions` and `longest_side_rel`.
 - **The "main path" is the longest path through the organoid.** In a branched organoid this path may turn from the trunk into a branch, so `tortuosity` and `rms_dev_rel` for the branched group do not describe "trunk curvature". Use these two metrics only to compare curvature **among single-tube organoids** (filter `n_junctions == 0`).
 - **`solidity` drops both with branching and with a curved tube**, so use it only as a cross-check.
+- **On the overlay**, a single tube shows its main path in cyan. A branched / network organoid has no single main path, so its whole skeleton is drawn in orange, and the title shows the verdict.
+
+**Showing that the new protocol gives single tubes (like a real gut) and the old one does not:**
+
+1. Put old and new images in two subfolders (e.g. `old/`, `new/`) and run the whole folder with **one** saved parameter set.
+2. Main result: **% of organoids that are a single tube** per group (bar chart in `group_comparison.png`, Fisher's exact test). For example: "18/20 new vs 2/20 old organoids formed a single tube, p < 0.001".
+3. Supporting results, per organoid: `main_path_fraction` (higher = more tube-like), `junctions_per_mm` and `n_cycles` (lower = less messy), with Mann–Whitney tests.
+4. Show a few representative overlays from each group as a figure, and skim all overlays to make sure no mask is wrong.
+5. Fix the "single tube" threshold (default 0.8) and the "Branch threshold" **before** looking at the results, and report them in the methods.
 
 ## 6. Tuning parameters
 
@@ -87,6 +99,7 @@ Results are saved to `data/results/`:
 | **Only one section detected**, the rest is fainter or more transparent | Decrease **Threshold for faint parts** (e.g. 0.4), or decrease **Threshold factor** |
 | A **dashed red** outline (dropped part) that is actually a section of the organoid | Increase **Join pieces up to this distance apart** until that section is joined |
 | Z-stack file where a section at another depth is lost | Under "Image reading and scale", choose **Merge slices** (default) |
+| Outline swallows grainy / cloudy cell clumps around the tubes, many short fake branches, thin connecting tubes missed | Change **Segmentation method** to "Tube network (ridge filter)". If thin tubes are still missed, enter a smaller **Typical tube width**; if the outline is too fat, a larger one |
 | Mask bleeds into the background in dark areas | Change **Segmentation method** to "Texture only", or increase **Threshold for faint parts** |
 | Fluorescence image analyzes the wrong channel | Under "Image reading and scale", set **Channel** (-1 = auto-pick GFP; channel 2/3 = 1) |
 
